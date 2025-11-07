@@ -267,7 +267,7 @@ list_records() {
 }
 
 # ...existing code...
-# 主菜单（保持不变）
+# 主菜单
 while true; do
     echo
     echo "=== Bunny DNS 管理菜单 ==="
