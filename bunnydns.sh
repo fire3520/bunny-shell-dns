@@ -1,7 +1,8 @@
 #!/bin/bash
+# ...existing code...
 
 # ==========================
-# 检查 curl
+# 检查 curl & jq
 # ==========================
 if ! command -v curl &>/dev/null; then
     echo "⚠️ curl 未安装，正在安装..."
@@ -12,53 +13,87 @@ if ! command -v curl &>/dev/null; then
     fi
 fi
 
-# ==========================
-# 配置
-# ==========================
-BASE_URL="https://api.bunny.net"
-API_KEY=""
-read -p "请输入 Bunny API Key: " API_KEY
-[[ -z "$API_KEY" ]] && echo "❌ 必须提供 API Key" && exit 1
+USE_JQ=0
+if command -v jq &>/dev/null; then
+    USE_JQ=1
+else
+    echo "⚠️ 建议安装 jq 用于更好解析 JSON：sudo apt install -y jq"
+fi
 
 # ==========================
-# API 请求函数
+# 配置（支持环境变量）
+# ==========================
+BASE_URL="https://api.bunny.net"
+API_KEY="${BUNNY_API_KEY:-}"
+if [[ -z "$API_KEY" ]]; then
+    read -p "请输入 Bunny API Key: " API_KEY
+fi
+[[ -z "$API_KEY" ]] && echo "❌ 必须提供 API Key（可通过环境变量 BUNNY_API_KEY 提供）" && exit 1
+
+# ==========================
+# API 请求函数（返回 body + 状态码）
 # ==========================
 api_request() {
     local method=$1
     local endpoint=$2
     local data=$3
+    local resp
 
     if [[ -n "$data" ]]; then
-        curl -s -X "$method" "$BASE_URL$endpoint" \
+        resp=$(curl -s -X "$method" "$BASE_URL$endpoint" \
             -H "AccessKey: $API_KEY" \
             -H "Content-Type: application/json" \
-            -d "$data"
+            -d "$data" -w "\n%{http_code}")
     else
-        curl -s -X "$method" "$BASE_URL$endpoint" \
+        resp=$(curl -s -X "$method" "$BASE_URL$endpoint" \
             -H "AccessKey: $API_KEY" \
-            -H "Content-Type: application/json"
+            -H "Content-Type: application/json" \
+            -w "\n%{http_code}")
     fi
+
+    # 输出 body 和 status（status 为最后一行）
+    echo "$resp"
 }
 
 check_api_response() {
     local resp="$1"
-    if echo "$resp" | grep -q '"ErrorKey"'; then
-        local msg=$(echo "$resp" | grep -o '"Message":[^,}]*' | sed 's/"Message"://;s/^\"//;s/\"$//')
-        echo "❌ 操作失败: $msg"
-        return 1
-    else
-        echo "✅ 操作成功"
+    local status=$(echo "$resp" | tail -n1 | tr -d '\r')
+    local body=$(echo "$resp" | sed '$d' | tr -d '\r')
+
+    # 成功的常见状态码：200, 201, 204
+    if [[ "$status" =~ ^(200|201|204)$ ]]; then
+        echo "✅ 操作成功 (HTTP $status)"
         return 0
     fi
+
+    # 尝试解析错误信息
+    local msg=""
+    if [[ $USE_JQ -eq 1 ]]; then
+        msg=$(echo "$body" | jq -r '.Message // .message // empty')
+    fi
+    if [[ -z "$msg" ]]; then
+        msg=$(echo "$body" | grep -o '"Message":[^,}]*' | sed 's/"Message"://;s/^\"//;s/\"$//' || true)
+    fi
+    msg=${msg:-"HTTP $status"}
+    echo "❌ 操作失败: $msg"
+    return 1
 }
 
 get_json_field() {
-    echo "$1" | grep -o "\"$2\"[[:space:]]*:[^,}]*" | sed "s/\"$2\"[[:space:]]*:[[:space:]]*//;s/^\"//;s/\"$//"
+    # 兼顾 jq 与简单正则解析（仅在无法使用 jq 时）
+    local body="$1"
+    local field="$2"
+    if [[ $USE_JQ -eq 1 ]]; then
+        echo "$body" | jq -r --arg f "$field" 'if type=="array" then .[0][$f] // empty else .[$f] // empty end' 2>/dev/null
+    else
+        echo "$body" | grep -o "\"$field\"[[:space:]]*:[^,}]*" | sed "s/\"$field\"[[:space:]]*:[[:space:]]*//;s/^\"//;s/\"$//"
+    fi
 }
 
 # ==========================
-# IP / Name 校验函数
+# IP / Name 校验函数（保持现有实现）
 # ==========================
+# ...existing code...
 is_valid_ipv4() {
     local ip=$1
     [[ $ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
@@ -75,24 +110,36 @@ is_valid_ipv6() {
 }
 
 is_valid_name() {
-    local name=$(echo "$1" | tr -d '\r' | xargs)  # 去掉首尾空格和回车
+    local name=$(echo "$1" | tr -d '\r' | xargs)
     [[ -z "$name" ]] && { echo "❌ 记录名不能为空"; return 1; }
     [[ "$name" =~ ^[a-zA-Z0-9\-\_@]+$ ]] || { echo "❌ 记录名只能包含字母、数字、-、_ 或 @"; return 1; }
     return 0
 }
+# ...existing code...
 
 # ==========================
-# 区域管理
+# 区域管理（使用更可靠的 JSON 解析）
 # ==========================
 list_zones() {
-    response=$(api_request GET "/dnszone")
-    [[ -z "$response" ]] && echo "❌ 无法获取 DNS 区域" && return
+    local resp=$(api_request GET "/dnszone")
+    local status=$(echo "$resp" | tail -n1 | tr -d '\r')
+    local body=$(echo "$resp" | sed '$d' | tr -d '\r')
+
+    if [[ ! "$status" =~ ^(200|201)$ ]]; then
+        check_api_response "$resp" || return
+    fi
+
     echo "=== DNS 区域 ==="
-    echo "$response" | tr '{' '\n' | while read line; do
-        id=$(get_json_field "$line" "Id")
-        domain=$(get_json_field "$line" "Domain")
-        [[ -n "$id" && -n "$domain" ]] && echo "$domain (ID: $id)"
-    done
+    if [[ $USE_JQ -eq 1 ]]; then
+        echo "$body" | jq -r '.[] | "\(.Domain) (ID: \(.Id))"' 2>/dev/null || echo "❌ 解析结果失败"
+    else
+        # 兼容旧解析方式（按对象分割）
+        echo "$body" | tr '{' '\n' | while read -r line; do
+            id=$(echo "$line" | grep -o "\"Id\"[[:space:]]*:[^,}]*" | sed 's/"Id"[[:space:]]*:[[:space:]]*//;s/^\"//;s/\"$//')
+            domain=$(echo "$line" | grep -o "\"Domain\"[[:space:]]*:[^,}]*" | sed 's/"Domain"[[:space:]]*:[[:space:]]*//;s/^\"//;s/\"$//')
+            [[ -n "$id" && -n "$domain" ]] && echo "$domain (ID: $id)"
+        done
+    fi
 }
 
 add_zone() {
@@ -112,9 +159,10 @@ delete_zone() {
 }
 
 # ==========================
-# 记录管理
+# 记录管理（list 使用 jq 或回退解析）
 # ==========================
 add_record() {
+    # ...existing code...
     local zone_id=$1
     echo "可选记录类型: A, AAAA, CNAME, MX, TXT, NS, Redirect"
     read -p "请输入记录类型: " type
@@ -150,6 +198,7 @@ add_record() {
 }
 
 update_record() {
+    # ...existing code...
     local zone_id=$1
     read -p "请输入记录 ID: " record_id
     read -p "请输入记录类型: " type
@@ -195,51 +244,30 @@ delete_record() {
 
 list_records() {
     local zone_id=$1
-    response=$(api_request GET "/dnszone/$zone_id")
-    [[ -z "$response" ]] && echo "❌ 无法获取记录" && return
+    local resp=$(api_request GET "/dnszone/$zone_id")
+    local status=$(echo "$resp" | tail -n1 | tr -d '\r')
+    local body=$(echo "$resp" | sed '$d' | tr -d '\r')
+
+    if [[ ! "$status" =~ ^(200|201)$ ]]; then
+        check_api_response "$resp" || return
+    fi
+
     echo "=== Records in Zone $zone_id ==="
-    echo "$response" | tr '{' '\n' | while read line; do
-        rid=$(get_json_field "$line" "Id")
-        type=$(get_json_field "$line" "Type")
-        name=$(get_json_field "$line" "Name")
-        value=$(get_json_field "$line" "Value")
-        [[ -n "$rid" && -n "$type" ]] && echo "Type $type | $name -> $value (ID: $rid)"
-    done
+    if [[ $USE_JQ -eq 1 ]]; then
+        echo "$body" | jq -r '.Records? // .[]? | if type=="object" then "\(.Id) \(.Type) \(.Name) -> \(.Value)" else tostring end' 2>/dev/null
+    else
+        echo "$body" | tr '{' '\n' | while read -r line; do
+            rid=$(echo "$line" | grep -o "\"Id\"[[:space:]]*:[^,}]*" | sed 's/"Id"[[:space:]]*:[[:space:]]*//;s/^\"//;s/\"$//')
+            type=$(echo "$line" | grep -o "\"Type\"[[:space:]]*:[^,}]*" | sed 's/"Type"[[:space:]]*:[[:space:]]*//;s/^\"//;s/\"$//')
+            name=$(echo "$line" | grep -o "\"Name\"[[:space:]]*:[^,}]*" | sed 's/"Name"[[:space:]]*:[[:space:]]*//;s/^\"//;s/\"$//')
+            value=$(echo "$line" | grep -o "\"Value\"[[:space:]]*:[^,}]*" | sed 's/"Value"[[:space:]]*:[[:space:]]*//;s/^\"//;s/\"$//')
+            [[ -n "$rid" && -n "$type" ]] && echo "Type $type | $name -> $value (ID: $rid)"
+        done
+    fi
 }
 
-# ==========================
-# 二级菜单：Zone 内管理记录
-# ==========================
-zone_menu() {
-    read -p "请输入 Zone ID 进入管理: " zone_id
-    zone_id=$(echo "$zone_id" | tr -d '\r' | xargs)
-    [[ -z "$zone_id" ]] && echo "❌ Zone ID 不能为空" && return
-
-    while true; do
-        echo
-        echo "=== Zone $zone_id 管理菜单 ==="
-        echo "1. 查看记录"
-        echo "2. 添加记录"
-        echo "3. 更新记录"
-        echo "4. 删除记录"
-        echo "0. 返回主菜单"
-        read -p "请选择操作: " choice
-        choice=$(echo "$choice" | tr -d '\r' | xargs)
-
-        case "$choice" in
-            1) list_records "$zone_id" ;;
-            2) add_record "$zone_id" ;;
-            3) update_record "$zone_id" ;;
-            4) delete_record "$zone_id" ;;
-            0) break ;;
-            *) echo "❌ 无效输入" ;;
-        esac
-    done
-}
-
-# ==========================
-# 主菜单
-# ==========================
+# ...existing code...
+# 主菜单（保持不变）
 while true; do
     echo
     echo "=== Bunny DNS 管理菜单 ==="
